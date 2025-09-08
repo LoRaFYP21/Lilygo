@@ -1,26 +1,7 @@
 /*
   LoRa Serial Chat (Reliable Fragments + Exact Tries) + PDR + Goodput
   ESP32 T-Display + SSD1306 + SX127x (Sandeep Mistry LoRa lib)
-
-  - If text <= FRAG_CHUNK: send one MSG, wait for final ACK.
-  - If text  > FRAG_CHUNK: split into MSGF fragments.
-      For each fragment i:
-        send -> wait ACKF(seq,i) with timeout; retry up to FRAG_MAX_TRIES (exact).
-      After last fragment is ACKF’d, wait for final ACK.
-      If final ACK fails, retry the WHOLE message up to MSG_MAX_TRIES (exact).
-
-  Packet formats:
-    MSG,  <src>,<dst>,<seq>,<text>
-    MSGF, <src>,<dst>,<seq>,<fragIdx>,<fragTot>,<chunk>
-    ACKF, <src>,<dst>,<seq>,<fragIdx>                      (per-fragment ack)
-    ACK,  <src>,<dst>,<seq>,<rxBytesTotal>,<rxPktsTotal>  (final ack)
-
-  Sender prints per-packet sizes, PDR (%), and goodput (b/s).
-  Receiver prints per-packet sizes and cumulative totals.
-
-  Notes:
-  - Unique IDs: full 48-bit efuse MAC (12 hex). If needed, hard-set MY_NODE_ID below.
-  - PDR is computed at the sender as peerRxPktsTotal / txDataPktsTotal (session-wide).
+  === AS923 variant (923 MHz) ===
 */
 
 #include <Wire.h>
@@ -29,10 +10,10 @@
 #include <SPI.h>
 #include <LoRa.h>
 
-// ---------- Radio config ----------
-#define FREQ_HZ   433E6
+// ---------- Radio config (AS923) ----------
+#define FREQ_HZ   923E6      // <- 923 MHz center (make sure your hardware supports it)
 #define LORA_SYNC 0xA5
-#define LORA_SF   8         // Try 9..12 if your link is weak
+#define LORA_SF   8          // Try 9..12 if your link is weak
 
 // Wiring (LilyGo T-Display -> SX127x)
 #define SCK   5
@@ -68,12 +49,12 @@ uint64_t txBytesTotal=0,   rxBytesTotal=0;         // app TEXT bytes totals
 
 // ---------- Timing / ARQ knobs ----------
 const size_t  FRAG_CHUNK = 200;                    // text bytes per fragment
-const int     FRAG_MAX_TRIES = 8;                  // per-fragment attempts (exact: 1..3)
+const int     FRAG_MAX_TRIES = 8;                  // per-fragment attempts
 const unsigned long FRAG_ACK_TIMEOUT_MS = 1000;    // wait for ACKF
 const unsigned long FRAG_SPACING_MS     = 15;      // small guard between tries
 
 const unsigned long BASE_FINAL_ACK_TIMEOUT_MS = 1800; // final ACK wait baseline
-const int     MSG_MAX_TRIES = 3;                   // whole-message attempts (exact: 1..3)
+const int     MSG_MAX_TRIES = 3;                   // whole-message attempts
 
 uint32_t txSeq=0;
 unsigned long sessionStartMs=0;
@@ -326,15 +307,15 @@ void setup(){
   LoRa.setSyncWord(LORA_SYNC);
   LoRa.enableCrc();
   LoRa.setTxPower(17, PA_OUTPUT_PA_BOOST_PIN);
-  // Optional robustness knobs (uncomment if needed):
-  // LoRa.setCodingRate4(8);          // 4/8 (max redundancy)
-  // LoRa.setSignalBandwidth(62.5E3); // narrower BW => better sensitivity
+  // Optional AS923-friendly robustness:
+  // LoRa.setSignalBandwidth(125E3);   // AS923 uses 125 kHz channels
+  // LoRa.setCodingRate4(5);           // 4/5 (default); 4/6..4/8 add redundancy
 
   sessionStartMs = millis();
   resetReasm();
 
-  oled3("LoRa Chat Ready","ID: "+myId,"433 MHz, SF="+String(LORA_SF));
-  Serial.println("=== LoRa Chat (Reliable + Exact Tries) ===");
+  oled3("LoRa Chat Ready","ID: "+myId,"923 MHz, SF="+String(LORA_SF));
+  Serial.println("=== LoRa Chat (Reliable + Exact Tries) — AS923 (923 MHz) ===");
   Serial.println("115200, Newline. Type and Enter.");
   Serial.print("Node ID: "); Serial.println(myId);
 }

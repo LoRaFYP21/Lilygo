@@ -1,20 +1,7 @@
-send just 200 txt by serial monitor: 
 /*
-  LoRa Serial Chat + Auto-ACK + Sizes + Throughput
+  LoRa Serial Chat (Reliable Fragments + Exact Tries) + PDR + Goodput
   ESP32 T-Display + SSD1306 + SX127x (Sandeep Mistry LoRa lib)
-
-  Type in Serial Monitor (Newline) -> send as MSG
-  Peer shows it (OLED+Serial) and auto-sends ACK including its rxBytesTotal.
-  Sender shows ACK OK + computes "goodput" (acknowledged payload bits/sec).
-
-  Packet formats:
-    MSG,<srcId>,<dstId>,<seq>,<text>
-    ACK,<srcId>,<dstId>,<seq>,<rxBytesTotal>
-
-  Notes:
-   - For two nodes we use <dstId>=FF (broadcast). ACKs are directed to sender.
-   - We sanitize commas in user text (replace with space) so CSV parsing is safe.
-   - Each device keeps independent local counters (txBytesTotal/rxBytesTotal).
+  === AS923 variant (923 MHz) ===
 */
 
 #include <Wire.h>
@@ -23,12 +10,12 @@ send just 200 txt by serial monitor:
 #include <SPI.h>
 #include <LoRa.h>
 
-// ----------- CONFIG -----------
-#define FREQ_HZ      433E6
-#define LORA_SYNC    0xA5
-#define LORA_SF      8
+// ---------- Radio config (AS923) ----------
+#define FREQ_HZ   923E6      // <- 923 MHz center (make sure your hardware supports it)
+#define LORA_SYNC 0xA5
+#define LORA_SF   8          // Try 9..12 if your link is weak
 
-// Your wiring (as you used successfully)
+// Wiring (LilyGo T-Display -> SX127x)
 #define SCK   5
 #define MISO  19
 #define MOSI  27
@@ -36,279 +23,356 @@ send just 200 txt by serial monitor:
 #define RST   14
 #define DIO0  26
 
-// Optional: hardcode an ID if you still see duplicates after using MAC
-// #define MY_NODE_ID "NODE_A"   // <= uncomment & set to force an ID
+// Optional: force distinct IDs on each board if desired
+// #define MY_NODE_ID "A"    // put "B" on the other board
 
-// ----------- OLED ------------
+// ---------- OLED ----------
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 static void oled3(const String& a, const String& b="", const String& c="") {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0,0);
-  display.println(a);
-  if (b.length()) display.println(b);
-  if (c.length()) display.println(c);
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0); display.println(a); if(b.length()) display.println(b); if(c.length()) display.println(c);
   display.display();
 }
 
-// ----------- IDs & state -----------
-String myId   = "????????";   // 8-hex chars from MAC (4 bytes)
-String dstAny = "FF";         // broadcast for two-node simplicity
-
-// Per-device independent tallies (payload bytes of MSG text only)
-uint32_t txPkts = 0, rxPkts = 0;
-uint64_t txBytesTotal = 0, rxBytesTotal = 0;
-
-// For ACK/throughput
-uint32_t txSeq = 0;
-bool     waitingAck = false;
-uint32_t waitingSeq = 0;
-unsigned long ackDeadline = 0;
-unsigned long sessionStartMs = 0;
-
-const unsigned long ACK_TIMEOUT_MS = 1500;
-const size_t        MAX_TEXT_LEN   = 200;
-
-// ----------- Helpers -----------
-static String bytesToHuman(uint64_t B) {
-  // simple SI units
-  if (B >= 1000000ULL)  return String((double)B/1000000.0, 3) + " MB";
-  if (B >= 1000ULL)     return String((double)B/1000.0, 3) + " kB";
-  return String((uint64_t)B) + " B";
+static void serialPrintLnChunked(const String& s, size_t ch=128){
+  for(size_t i=0;i<s.length();i+=ch){ size_t n=min(ch, s.length()-i); Serial.write((const uint8_t*)s.c_str()+i, n); }
+  Serial.write('\n');
 }
 
-static String bitsToHuman(uint64_t bits) {
-  if (bits >= 1000000ULL) return String((double)bits/1000000.0, 3) + " Mb";
-  if (bits >= 1000ULL)    return String((double)bits/1000.0, 3) + " kb";
-  return String((uint64_t)bits) + " b";
-}
+// ---------- IDs & counters ----------
+String myId="????????????", dstAny="FF";           // 12-hex MAC, broadcast dst
+uint64_t txDataPktsTotal=0, rxDataPktsTotal=0;     // counts MSG + unique MSGF frags
+uint64_t txBytesTotal=0,   rxBytesTotal=0;         // app TEXT bytes totals
 
-static String speedToHuman(double bps) {
-  if (bps >= 1e6) return String(bps/1e6, 3) + " Mb/s";
-  if (bps >= 1e3) return String(bps/1e3, 3) + " kb/s";
-  return String(bps, 0) + " b/s";
-}
+// ---------- Timing / ARQ knobs ----------
+const size_t  FRAG_CHUNK = 200;                    // text bytes per fragment
+const int     FRAG_MAX_TRIES = 8;                  // per-fragment attempts
+const unsigned long FRAG_ACK_TIMEOUT_MS = 1000;    // wait for ACKF
+const unsigned long FRAG_SPACING_MS     = 15;      // small guard between tries
 
-static void macTo8Hex(String& out) {
-  // use lower 4 bytes of efuse MAC -> 8 hex chars (much lower collision chance)
-  uint64_t mac = ESP.getEfuseMac(); // 48-bit unique
-  uint32_t low = (uint32_t)(mac & 0xFFFFFFFFULL);
-  char buf[9];
-  sprintf(buf, "%08X", low);
-  out = String(buf);
-}
+const unsigned long BASE_FINAL_ACK_TIMEOUT_MS = 1800; // final ACK wait baseline
+const int     MSG_MAX_TRIES = 3;                   // whole-message attempts
 
-// sanitize commas/newlines so CSV parsing stays simple
-static void sanitizeText(String& s) {
-  for (uint16_t i=0;i<s.length();++i) {
-    char c = s[i];
-    if (c == ',' || c == '\r' || c == '\n') s.setCharAt(i, ' ');
+uint32_t txSeq=0;
+unsigned long sessionStartMs=0;
+
+// ---------- Helpers ----------
+static String bytesToHuman(uint64_t B){ if(B>=1000000ULL) return String((double)B/1e6,3)+" MB";
+  if(B>=1000ULL) return String((double)B/1e3,3)+" kB"; return String((uint64_t)B)+" B"; }
+static String bitsToHuman(uint64_t b){ if(b>=1000000ULL) return String((double)b/1e6,3)+" Mb";
+  if(b>=1000ULL)    return String((double)b/1e3,3)+" kb"; return String((uint64_t)b)+" b"; }
+static String speedToHuman(double bps){ if(bps>=1e6) return String(bps/1e6,3)+" Mb/s";
+  if(bps>=1e3) return String(bps/1e3,3)+" kb/s"; return String(bps,0)+" b/s"; }
+static void macTo12Hex(String& out){ uint64_t mac=ESP.getEfuseMac(); char buf[13];
+  sprintf(buf,"%04X%08X",(uint16_t)(mac>>32),(uint32_t)mac); out=String(buf); }
+static void sanitizeText(String& s){ for(uint16_t i=0;i<s.length();++i){ char c=s[i]; if(c==','||c=='\r'||c=='\n') s.setCharAt(i,' '); } }
+static void sendLoRa(const String& payload){ LoRa.beginPacket(); LoRa.print(payload); LoRa.endPacket(); }
+static long toLong(const String& s){ long v=0; bool seen=false; for(uint16_t i=0;i<s.length();++i){ char c=s[i];
+  if(c>='0'&&c<='9'){ v=v*10+(c-'0'); seen=true; } else if(seen) break; } return seen? v:-1; }
+
+// ---------- Parsers ----------
+static bool parseMSG (const String& in, String& src,String& dst,long& seq,String& text){
+  if(!in.startsWith("MSG,")) return false; int p1=in.indexOf(',',4); if(p1<0) return false;
+  int p2=in.indexOf(',',p1+1); if(p2<0) return false; int p3=in.indexOf(',',p2+1); if(p3<0) return false;
+  src=in.substring(4,p1); dst=in.substring(p1+1,p2); String seqStr=in.substring(p2+1,p3); text=in.substring(p3+1); seq=toLong(seqStr); return true; }
+
+static bool parseMSGF(const String& in, String& src,String& dst,long& seq,long& idx,long& tot,String& chunk){
+  if(!in.startsWith("MSGF,")) return false; int p1=in.indexOf(',',5); if(p1<0) return false;
+  int p2=in.indexOf(',',p1+1); if(p2<0) return false; int p3=in.indexOf(',',p2+1); if(p3<0) return false;
+  int p4=in.indexOf(',',p3+1); if(p4<0) return false; int p5=in.indexOf(',',p4+1); if(p5<0) return false;
+  src=in.substring(5,p1); dst=in.substring(p1+1,p2); String seqStr=in.substring(p2+1,p3);
+  String idxStr=in.substring(p3+1,p4); String totStr=in.substring(p4+1,p5); chunk=in.substring(p5+1);
+  seq=toLong(seqStr); idx=toLong(idxStr); tot=toLong(totStr); return true; }
+
+static bool parseACKF(const String& in, String& src,String& dst,long& seq,long& idx){
+  if(!in.startsWith("ACKF,")) return false; int p1=in.indexOf(',',5); if(p1<0) return false;
+  int p2=in.indexOf(',',p1+1); if(p2<0) return false; int p3=in.indexOf(',',p2+1); if(p3<0) return false;
+  src=in.substring(5,p1); dst=in.substring(p1+1,p2); String seqStr=in.substring(p2+1,p3); String idxStr=in.substring(p3+1);
+  seq=toLong(seqStr); idx=toLong(idxStr); return true; }
+
+static bool parseACK (const String& in, String& src,String& dst,long& seq,uint64_t& rxTotBytes,uint64_t& rxTotPkts){
+  if(!in.startsWith("ACK,")) return false; int p1=in.indexOf(',',4); if(p1<0) return false;
+  int p2=in.indexOf(',',p1+1); if(p2<0) return false; int p3=in.indexOf(',',p2+1); if(p3<0) return false; int p4=in.indexOf(',',p3+1); if(p4<0) return false;
+  src=in.substring(4,p1); dst=in.substring(p1+1,p2); String seqStr=in.substring(p2+1,p3); String bStr=in.substring(p3+1,p4); String kStr=in.substring(p4+1);
+  seq=toLong(seqStr); rxTotBytes=(uint64_t)bStr.toDouble(); rxTotPkts=(uint64_t)kStr.toDouble(); return true; }
+
+// ---------- RX reassembly (one in-flight per peer) ----------
+String   reSrc=""; long reSeq=-1; long reTot=0; long reGot=0;
+String*  reChunks=nullptr; bool* reHave=nullptr;
+
+void resetReasm(){ if(reChunks){ delete[] reChunks; reChunks=nullptr; } if(reHave){ delete[] reHave; reHave=nullptr; } reSrc=""; reSeq=-1; reTot=0; reGot=0; }
+void startReasm(const String& src, long seq, long tot){ resetReasm(); reSrc=src; reSeq=seq; reTot=tot; reGot=0; reChunks=new String[tot]; reHave=new bool[tot]; for(long i=0;i<tot;i++) reHave[i]=false; }
+bool addFrag(long idx, const String& chunk){ if(idx<0||idx>=reTot) return false; if(!reHave[idx]){ reHave[idx]=true; reChunks[idx]=chunk; reGot++; return true; } return false; }
+String joinReasm(){ String out; out.reserve(reTot*FRAG_CHUNK); for(long i=0;i<reTot;i++) out += reChunks[i]; return out; }
+
+// ---------- Blocking waits (consume radio while waiting) ----------
+bool waitForAckF(long expectSeq, long expectIdx, unsigned long timeoutMs){
+  unsigned long deadline=millis()+timeoutMs;
+  while((long)(millis()-deadline)<0){
+    int psz=LoRa.parsePacket();
+    if(psz){
+      String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+      String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t b=0,k=0;
+
+      if(parseACKF(pkt,s,d,seq,idx)){
+        if(d==myId && seq==expectSeq && idx==expectIdx) return true; // got it
+      }
+      else if(parseACK(pkt,s,d,seq,b,k)){ /* ignore here */ }
+      else if(parseMSG(pkt,s,d,seq,t)){
+        size_t pktBytes=pkt.length(), textBytes=t.length();
+        rxDataPktsTotal++; rxBytesTotal+=textBytes;
+        Serial.printf("[RX] #%ld from %s (single while waiting)\n", seq, s.c_str());
+        Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
+        Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",(unsigned)textBytes, bytesToHuman(textBytes).c_str(), (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+        serialPrintLnChunked(t);
+        oled3("RX <- ("+String(seq)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
+        String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+        sendLoRa(ack);
+      }
+      else if(parseMSGF(pkt,s,d,seq,idx,tot,t)){
+        if(s!=reSrc||seq!=reSeq) startReasm(s,seq,tot);
+        bool fresh=addFrag(idx,t);
+        if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); } // unique only
+        String ackf="ACKF,"+myId+","+s+","+String(seq)+","+String(idx); sendLoRa(ackf);
+
+        bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
+        if(all){
+          String full=joinReasm();
+          Serial.printf("[RX FULL] #%ld from %s | total text %uB\n", seq, s.c_str(), (unsigned)full.length());
+          serialPrintLnChunked(full);
+          oled3("RX <- ("+String(seq)+")","full msg", bytesToHuman(full.length()));
+          String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+          sendLoRa(ack); resetReasm();
+        }
+      }
+    }
+    delay(1);
   }
+  return false; // timeout
 }
 
-static void sendLoRa(const String& payload) {
-  LoRa.beginPacket();
-  LoRa.print(payload);
-  LoRa.endPacket();
-}
+bool waitForFinalAck(long expectSeq, unsigned long timeoutMs, double &pdrOut, double &bpsOut){
+  unsigned long deadline=millis()+timeoutMs; pdrOut=0; bpsOut=0;
+  while((long)(millis()-deadline)<0){
+    int psz=LoRa.parsePacket();
+    if(psz){
+      String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+      String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t peerBytes=0, peerPkts=0;
 
-static long toLong(const String& s) {
-  long v=0; bool seen=false;
-  for (uint16_t i=0;i<s.length();++i) {
-    char c=s[i];
-    if (c>='0' && c<='9') { v=v*10+(c-'0'); seen=true; }
-    else if (seen) break;
+      if(parseACK(pkt,s,d,seq,peerBytes,peerPkts)){
+        if(d==myId && seq==expectSeq){
+          unsigned long elapsed=millis()-sessionStartMs;
+          bpsOut = elapsed? (peerBytes*8.0*1000.0/elapsed) : 0.0;
+          pdrOut = (txDataPktsTotal>0)? (100.0*(double)peerPkts/(double)txDataPktsTotal) : 0.0;
+          int rssi=LoRa.packetRssi(); float snr=LoRa.packetSnr();
+          Serial.printf("[ACK OK] #%ld from %s | peerRxBytes=%llu | peerRxPkts=%llu | PDR=%.1f%% | %s | RSSI %d | SNR %.1f\n",
+                        seq, s.c_str(), (unsigned long long)peerBytes, (unsigned long long)peerPkts,
+                        pdrOut, speedToHuman(bpsOut).c_str(), rssi, snr);
+          oled3("ACK OK ("+String(seq)+")", "PDR "+String(pdrOut,1)+"%  "+bytesToHuman(peerBytes), speedToHuman(bpsOut));
+          return true;
+        }
+      } else {
+        // process other traffic while we wait
+        String s2,d2; long seq2=-1,idx2=-1,tot2=-1; uint64_t b2=0,k2=0;
+        if(parseMSG(pkt,s2,d2,seq2,t)){
+          size_t pktBytes=pkt.length(), textBytes=t.length();
+          rxDataPktsTotal++; rxBytesTotal+=textBytes;
+          Serial.printf("[RX] #%ld from %s (single while waiting ACK)\n", seq2, s2.c_str());
+          Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
+          Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",(unsigned)textBytes, bytesToHuman(textBytes).c_str(), (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+          serialPrintLnChunked(t);
+          oled3("RX <- ("+String(seq2)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
+          String ack="ACK,"+myId+","+s2+","+String(seq2)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+          sendLoRa(ack);
+        } else if(parseMSGF(pkt,s2,d2,seq2,idx2,tot2,t)){
+          if(s2!=reSrc||seq2!=reSeq) startReasm(s2,seq2,tot2);
+          bool fresh=addFrag(idx2,t);
+          if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); }
+          String ackf="ACKF,"+myId+","+s2+","+String(seq2)+","+String(idx2); sendLoRa(ackf);
+          bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
+          if(all){
+            String full=joinReasm();
+            Serial.printf("[RX FULL] #%ld from %s | total text %uB\n", seq2, s2.c_str(), (unsigned)full.length());
+            serialPrintLnChunked(full);
+            oled3("RX <- ("+String(seq2)+")","full msg", bytesToHuman(full.length()));
+            String ack="ACK,"+myId+","+s2+","+String(seq2)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+            sendLoRa(ack); resetReasm();
+          }
+        } else if(parseACKF(pkt,s2,d2,seq2,idx2)){
+          // ignore here; fragment sender's loop is waiting for its own ACKF
+        }
+      }
+    }
+    delay(1);
   }
-  return seen ? v : -1;
+  return false; // timeout
 }
 
-// MSG: "MSG,<src>,<dst>,<seq>,<text>"
-static bool parseMSG(const String& in, String& src, String& dst, long& seq, String& text) {
-  if (!in.startsWith("MSG,")) return false;
-  int p1=in.indexOf(',',4);  if(p1<0) return false;
-  int p2=in.indexOf(',',p1+1); if(p2<0) return false;
-  int p3=in.indexOf(',',p2+1); if(p3<0) return false;
-  src = in.substring(4,p1);
-  dst = in.substring(p1+1,p2);
-  String seqStr = in.substring(p2+1,p3);
-  text = in.substring(p3+1);
-  seq = toLong(seqStr);
-  return true;
-}
+// ---------- Send one message reliably (with EXACT tries) ----------
+bool sendMessageReliable(const String& lineIn){
+  String line=lineIn; sanitizeText(line);
+  const bool single = (line.length() <= FRAG_CHUNK);
+  const size_t L=line.length();
+  const size_t total = single ? 1 : (L + FRAG_CHUNK - 1)/FRAG_CHUNK;
 
-// ACK: "ACK,<src>,<dst>,<seq>,<rxBytesTotal>"
-static bool parseACK(const String& in, String& src, String& dst, long& seq, uint64_t& rxTot) {
-  if (!in.startsWith("ACK,")) return false;
-  int p1=in.indexOf(',',4);  if(p1<0) return false;
-  int p2=in.indexOf(',',p1+1); if(p2<0) return false;
-  int p3=in.indexOf(',',p2+1); if(p3<0) return false;
-  src = in.substring(4,p1);
-  dst = in.substring(p1+1,p2);
-  String seqStr = in.substring(p2+1,p3);
-  String totStr = in.substring(p3+1);
-  seq = toLong(seqStr);
-  rxTot = (uint64_t) totStr.toDouble(); // totStr is integer text; toDouble handles big numbers ok
-  return true;
-}
+  // Reserve a seq for this logical message and KEEP IT across attempts
+  uint32_t seq = txSeq;
+  txSeq++;
 
-void setup() {
-  Serial.begin(115200);
-  Serial.setTimeout(10);
+  for(int attempt=1; attempt<=MSG_MAX_TRIES; ++attempt){
+    Serial.printf("[ATTEMPT %d/%d] seq #%lu\n", attempt, MSG_MAX_TRIES, (unsigned long)seq);
 
-  Wire.begin();
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 init failed");
-    for(;;);
+    if(single){
+      String payload="MSG,"+myId+","+dstAny+","+String(seq)+","+line;
+      sendLoRa(payload);
+      size_t pktBytes=payload.length(), textBytes=line.length();
+      txDataPktsTotal++; txBytesTotal+=textBytes;
+
+      Serial.printf("  [TX] single %u bytes (%s, %s) | txt %uB\n",
+                    (unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str(),
+                    (unsigned)textBytes);
+      oled3("TX -> ("+String(seq)+")", line.substring(0,16), "txt "+String(textBytes)+"B");
+
+      double pdr=0,bps=0;
+      if(waitForFinalAck(seq, BASE_FINAL_ACK_TIMEOUT_MS, pdr, bps)) return true;
+
+      Serial.println("  -> final ACK timeout, will retry whole message");
+      delay(100);
+    } else {
+      bool fragFailed=false;
+
+      for(size_t i=0;i<total;i++){
+        size_t off=i*FRAG_CHUNK;
+        String chunk=line.substring(off, min(L, off+FRAG_CHUNK));
+        String payload="MSGF,"+myId+","+dstAny+","+String(seq)+","+String(i)+","+String(total)+","+chunk;
+
+        bool ok=false;
+        for(int ftry=1; ftry<=FRAG_MAX_TRIES; ++ftry){
+          sendLoRa(payload);
+          size_t pktBytes=payload.length();
+          txDataPktsTotal++; txBytesTotal+=chunk.length();
+
+          Serial.printf("  [TX FRAG %u/%u try %d] %u bytes (%s, %s) | txt %uB\n",
+                        (unsigned)(i+1), (unsigned)total, ftry, (unsigned)pktBytes,
+                        bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str(),
+                        (unsigned)chunk.length());
+
+          ok = waitForAckF((long)seq, (long)i, FRAG_ACK_TIMEOUT_MS);
+          if(ok) break;
+
+          if(ftry < FRAG_MAX_TRIES) Serial.println("   -> no ACKF, retrying...");
+          else                      Serial.println("   -> no ACKF, giving up fragment");
+          delay(FRAG_SPACING_MS);
+        }
+
+        if(!ok){ fragFailed=true; break; }
+      }
+
+      if(fragFailed){
+        Serial.println("  -> fragment failed after retries, will retry whole message");
+        delay(150);
+      } else {
+        double pdr=0,bps=0;
+        unsigned long finalWait = BASE_FINAL_ACK_TIMEOUT_MS + total*500;
+        if(waitForFinalAck(seq, finalWait, pdr, bps)) return true;
+
+        Serial.println("  -> final ACK timeout, will retry whole message");
+        delay(150);
+      }
+    }
   }
+
+  Serial.println("[ABORT] message failed after MSG_MAX_TRIES");
+  oled3("SEND FAILED","after retries","");
+  return false;
+}
+
+// ---------- Setup / Loop ----------
+void setup(){
+  Serial.begin(115200); Serial.setTimeout(10);
+  Wire.begin(); if(!display.begin(SSD1306_SWITCHCAPVCC,0x3C)){ Serial.println("SSD1306 fail"); for(;;); }
 
 #ifdef MY_NODE_ID
   myId = String(MY_NODE_ID);
 #else
-  macTo8Hex(myId);           // unique 8-hex ID from MAC
+  macTo12Hex(myId);  // full 48-bit MAC -> 12 hex
 #endif
 
-  SPI.begin(SCK, MISO, MOSI, SS);
-  LoRa.setPins(SS, RST, DIO0);
-  if (!LoRa.begin(FREQ_HZ)) {
-    oled3("LoRa init FAILED","Check wiring/freq");
-    Serial.println("LoRa init FAILED");
-    for(;;);
-  }
+  SPI.begin(SCK,MISO,MOSI,SS); LoRa.setPins(SS,RST,DIO0);
+  if(!LoRa.begin(FREQ_HZ)){ oled3("LoRa init FAILED","Check wiring/freq"); for(;;); }
   LoRa.setSpreadingFactor(LORA_SF);
   LoRa.setSyncWord(LORA_SYNC);
   LoRa.enableCrc();
   LoRa.setTxPower(17, PA_OUTPUT_PA_BOOST_PIN);
+  // Optional AS923-friendly robustness:
+  // LoRa.setSignalBandwidth(125E3);   // AS923 uses 125 kHz channels
+  // LoRa.setCodingRate4(5);           // 4/5 (default); 4/6..4/8 add redundancy
 
   sessionStartMs = millis();
+  resetReasm();
 
-  oled3("LoRa Chat Ready", "ID: " + myId, "433 MHz, SF=8");
-  Serial.println("=== LoRa Chat Ready ===");
-  Serial.println("Set Serial Monitor to 115200, Newline. Type and Enter.");
+  oled3("LoRa Chat Ready","ID: "+myId,"923 MHz, SF="+String(LORA_SF));
+  Serial.println("=== LoRa Chat (Reliable + Exact Tries) — AS923 (923 MHz) ===");
+  Serial.println("115200, Newline. Type and Enter.");
   Serial.print("Node ID: "); Serial.println(myId);
 }
 
-void loop() {
-  // ----- 1) Serial -> LoRa -----
-  if (Serial.available()) {
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() > 0) {
-      sanitizeText(line);                // commas/newlines -> spaces
-      if (line.length() > MAX_TEXT_LEN) line = line.substring(0, MAX_TEXT_LEN);
-
-      // Build MSG CSV
-      String payload = "MSG," + myId + "," + dstAny + "," + String(txSeq) + "," + line;
-
-      // Send
-      sendLoRa(payload);
-
-      // Local per-packet + totals (payload is whole CSV; we only count text for txBytesTotal)
-      size_t pktBytes = payload.length();
-      size_t textBytes = line.length();
-      txPkts++;
-      txBytesTotal += textBytes;
-
-      // Prints
-      Serial.printf("[TX] #%lu \"%s\"\n", (unsigned long)txSeq, line.c_str());
-      Serial.printf("     Packet: %u bytes (%s, %s)\n",
-                    (unsigned)pktBytes,
-                    bitsToHuman((uint64_t)pktBytes*8).c_str(),
-                    bytesToHuman(pktBytes).c_str());
-      Serial.printf("     Text:   %u bytes (%s)\n",
-                    (unsigned)textBytes,
-                    bytesToHuman(textBytes).c_str());
-
-      oled3("TX -> (" + String(txSeq) + ")", line,
-            "pkt " + String(pktBytes) + "B | txt " + String(textBytes) + "B");
-
-      // Start ACK wait
-      waitingAck  = true;
-      waitingSeq  = txSeq;
-      ackDeadline = millis() + ACK_TIMEOUT_MS;
-      txSeq++;
-    }
+void loop(){
+  // 1) Send when user types
+  if(Serial.available()){
+    String line=Serial.readStringUntil('\n'); line.trim();
+    if(line.length()) sendMessageReliable(line);
   }
 
-  // ----- 2) LoRa -> handle incoming -----
-  int sz = LoRa.parsePacket();
-  if (sz) {
-    String pkt;
-    while (LoRa.available()) pkt += (char)LoRa.read();
-    int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
+  // 2) Otherwise receive and serve peers
+  int psz=LoRa.parsePacket();
+  if(psz){
+    String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+    String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t b=0,k=0;
 
-    // Try ACK parse first
-    String aSrc, aDst; long aSeq = -1; uint64_t peerRxTot = 0;
-    if (parseACK(pkt, aSrc, aDst, aSeq, peerRxTot)) {
-      if (aDst == myId && waitingAck && aSeq == (long)waitingSeq) {
-        waitingAck = false;
-
-        // Compute "goodput" from peer's reported rxBytesTotal (text bytes received)
-        unsigned long elapsedMs = millis() - sessionStartMs;
-        double bps = (elapsedMs > 0)
-                     ? ( (double)peerRxTot * 8.0 * 1000.0 / (double)elapsedMs )
-                     : 0.0;
-
-        Serial.printf("[ACK OK] #%ld from %s | peerRxTot=%llu bytes | %s | RSSI %d | SNR %.1f\n",
-                      aSeq, aSrc.c_str(),
-                      (unsigned long long)peerRxTot,
-                      speedToHuman(bps).c_str(),
-                      rssi, snr);
-
-        oled3("ACK OK (" + String(aSeq) + ")",
-              "peer RX " + bytesToHuman(peerRxTot),
-              speedToHuman(bps));
-      } else {
-        // stray/old ACK
-        Serial.printf("[ACK] %s -> %s | #%ld | rxTot=%llu | RSSI %d | SNR %.1f\n",
-                      aSrc.c_str(), aDst.c_str(), aSeq,
-                      (unsigned long long)peerRxTot, rssi, snr);
-      }
+    if(parseACK(pkt,s,d,seq,b,k)){
+      Serial.printf("[ACK stray] #%ld from %s | rxBytes=%llu rxPkts=%llu\n",
+                    seq, s.c_str(), (unsigned long long)b, (unsigned long long)k);
+      return;
     }
-    else {
-      // Try MSG
-      String mSrc, mDst, mText; long mSeq = -1;
-      if (parseMSG(pkt, mSrc, mDst, mSeq, mText)) {
-        // Per-packet counts (we treat "text" length as delivered app payload)
-        size_t pktBytes = pkt.length();
-        size_t textBytes = mText.length();
-        rxPkts++;
-        rxBytesTotal += textBytes;
-
-        Serial.printf("[RX] #%ld from %s: \"%s\"\n", mSeq, mSrc.c_str(), mText.c_str());
-        Serial.printf("     Packet: %u bytes (%s, %s)\n",
-                      (unsigned)pktBytes,
-                      bitsToHuman((uint64_t)pktBytes*8).c_str(),
-                      bytesToHuman(pktBytes).c_str());
-        Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu bytes\n",
-                      (unsigned)textBytes,
-                      bytesToHuman(textBytes).c_str(),
-                      (unsigned long long)rxBytesTotal);
-
-        oled3("RX <- (" + String(mSeq) + ")", mText,
-              "pkt " + String(pktBytes) + "B | txt " + String(textBytes) + "B");
-
-        // Auto-ACK back to sender with my rxBytesTotal (text bytes)
-        String ack = "ACK," + myId + "," + mSrc + "," + String(mSeq) + "," + String((unsigned long long)rxBytesTotal);
-        sendLoRa(ack);
-        Serial.printf("[TX] %s\n", ack.c_str());
-      } else {
-        // Unknown payload
-        Serial.printf("[RX RAW] %s | %u bytes | RSSI %d | SNR %.1f\n",
-                      pkt.c_str(), (unsigned)pkt.length(), rssi, snr);
-      }
+    if(parseACKF(pkt,s,d,seq,idx)){
+      // stray ACKF (we aren't waiting here) → ignore
+      return;
     }
-  }
+    if(parseMSG(pkt,s,d,seq,t)){
+      size_t pktBytes=pkt.length(), textBytes=t.length();
+      rxDataPktsTotal++; rxBytesTotal+=textBytes;
+      Serial.printf("[RX] #%ld from %s (single)\n", seq, s.c_str());
+      Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
+      Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",
+                    (unsigned)textBytes, bytesToHuman(textBytes).c_str(),
+                    (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+      serialPrintLnChunked(t);
+      oled3("RX <- ("+String(seq)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
+      String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+      sendLoRa(ack); return;
+    }
+    if(parseMSGF(pkt,s,d,seq,idx,tot,t)){
+      if(s!=reSrc||seq!=reSeq) startReasm(s,seq,tot);
+      bool fresh=addFrag(idx,t);
+      if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); }
+      String ackf="ACKF,"+myId+","+s+","+String(seq)+","+String(idx); sendLoRa(ackf);
 
-  // ----- 3) ACK timeout -----
-  if (waitingAck && (long)(millis() - ackDeadline) >= 0) {
-    waitingAck = false;
-    Serial.printf("[ACK TIMEOUT] seq #%lu (no ack)\n", (unsigned long)waitingSeq);
-    oled3("ACK TIMEOUT", "seq " + String(waitingSeq), "");
+      bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
+      if(all){
+        String full=joinReasm();
+        Serial.printf("[RX FULL] #%ld from %s | total text %uB\n", seq, s.c_str(), (unsigned)full.length());
+        serialPrintLnChunked(full);
+        oled3("RX <- ("+String(seq)+")","full msg", bytesToHuman(full.length()));
+        String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
+        sendLoRa(ack); resetReasm();
+      }
+      return;
+    }
+    // else: unknown payload, ignore
   }
 
   delay(1);
