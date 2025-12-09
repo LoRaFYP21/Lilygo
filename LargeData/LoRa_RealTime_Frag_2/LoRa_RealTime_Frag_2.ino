@@ -1,7 +1,21 @@
 /*
-  LoRa Serial Chat (Reliable Fragments + Exact Tries) + PDR + Goodput
+  LoRa Serial Chat (Reliable Fragments + Exact Tries) + PDR + Goodput + TIMING CSV + LittleFS
   ESP32 T-Display + SSD1306 + SX127x (Sandeep Mistry LoRa lib)
   === AS923 variant (923 MHz) ===
+
+  CSV line format (one per event):
+  TIM,<nodeId>,<role>,<event>,<seq>,<idx>,<tot>,<bytes>,<rssi>,<snr>,<toa_ms>,<t_ms>,<dt_ms>
+
+  role: TX | RX
+  event: SESSION_START | MSG_TX | MSG_RX | MSGF_TX | MSGF_RX | ACK_TX | ACK_RX | ACKF_TX | ACKF_RX
+         | WAIT_ACKF_START | WAIT_ACKF_OK | WAIT_ACKF_TO
+         | WAIT_ACK_START  | WAIT_ACK_OK  | WAIT_ACK_TO
+         | RETRY_MSG | RETRY_FRAG | ABORT
+
+  Notes:
+  - rssi/snr are only meaningful on RX; TX lines print rssi=-, snr=-
+  - toa_ms is estimated airtime for the just-sent/just-received payload
+  - t_ms is wall time since boot (millis), dt_ms is delta since previous event on this node
 */
 
 #include <Wire.h>
@@ -9,11 +23,16 @@
 #include <Adafruit_SSD1306.h>
 #include <SPI.h>
 #include <LoRa.h>
+#include <FS.h>
+#include <LittleFS.h>
 
 // ---------- Radio config (AS923) ----------
-#define FREQ_HZ   923E6      // <- 923 MHz center (make sure your hardware supports it)
+#define FREQ_HZ   923E6
 #define LORA_SYNC 0xA5
-#define LORA_SF   8          // Try 9..12 if your link is weak
+#define LORA_SF   8
+#define LORA_BW_HZ        125000
+#define LORA_CR_DEN       5        // 4/5 => 5
+#define LORA_HAS_CRC      1
 
 // Wiring (LilyGo T-Display -> SX127x)
 #define SCK   5
@@ -22,9 +41,6 @@
 #define SS    18
 #define RST   14
 #define DIO0  26
-
-// Optional: force distinct IDs on each board if desired
-// #define MY_NODE_ID "A"    // put "B" on the other board
 
 // ---------- OLED ----------
 #define SCREEN_WIDTH  128
@@ -58,6 +74,38 @@ const int     MSG_MAX_TRIES = 3;                   // whole-message attempts
 
 uint32_t txSeq=0;
 unsigned long sessionStartMs=0;
+unsigned long lastEventMs=0; // for dt_ms
+
+// ---------- LittleFS logging ----------
+File gLogFile;
+String gLogPath;
+
+static String makeLogPath(const String& nodeId, unsigned long sessStart) {
+  return String("/logs/") + nodeId + "_" + String(sessStart) + ".csv";
+}
+
+static void openCsvLog() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("[LOG] LittleFS mount FAILED");
+    return;
+  }
+  gLogPath = makeLogPath(myId, sessionStartMs);
+  gLogFile = LittleFS.open(gLogPath, FILE_WRITE);
+  if (!gLogFile) {
+    Serial.println(String("[LOG] open failed: ") + gLogPath);
+    return;
+  }
+  gLogFile.println("TIM_HDR,nodeId,role,event,seq,idx,tot,bytes,rssi,snr,toa_ms,t_ms,dt_ms");
+  gLogFile.flush();
+  Serial.println(String("[LOG] writing to ") + gLogPath);
+}
+
+static void writeCsvLine(const String& line) {
+  if (gLogFile) {
+    gLogFile.println(line);
+    gLogFile.flush();
+  }
+}
 
 // ---------- Helpers ----------
 static String bytesToHuman(uint64_t B){ if(B>=1000000ULL) return String((double)B/1e6,3)+" MB";
@@ -72,6 +120,69 @@ static void sanitizeText(String& s){ for(uint16_t i=0;i<s.length();++i){ char c=
 static void sendLoRa(const String& payload){ LoRa.beginPacket(); LoRa.print(payload); LoRa.endPacket(); }
 static long toLong(const String& s){ long v=0; bool seen=false; for(uint16_t i=0;i<s.length();++i){ char c=s[i];
   if(c>='0'&&c<='9'){ v=v*10+(c-'0'); seen=true; } else if(seen) break; } return seen? v:-1; }
+
+// ---------- LoRa ToA estimator (ms) ----------
+static double loraToaMs(size_t payloadLen) {
+  const double SF = LORA_SF;
+  const double BW = (double)LORA_BW_HZ;
+  const int CRden = LORA_CR_DEN;
+  const int CRC = LORA_HAS_CRC ? 1 : 0;
+  const int IH = 0; // explicit header
+  const int DE = ( (SF >= 11) && (BW == 125000) ) ? 1 : 0;
+
+  const double Ts = (double)( (1 << (int)SF) ) / BW; // s
+  const double Tpre = (8.0 + 4.25) * Ts;
+
+  int cr = (CRden - 4); // 1..4
+  double payloadSymbNb = 8.0 + max(
+    (int)ceil(
+      ( (double)(8*payloadLen) - 4.0*SF + 28.0 + 16.0*CRC - 20.0*IH )
+      / ( 4.0*(SF - 2.0*DE) )
+    ) * (cr + 4),
+    0
+  );
+
+  double Tpl = payloadSymbNb * Ts;
+  return (Tpre + Tpl) * 1000.0;
+}
+
+// ---------- CSV Timing logger ----------
+static void logEvt(const char* role, const char* event,
+                   long seq, long idx, long tot, long bytes,
+                   const String& rssiStr, const String& snrStr,
+                   double toa_ms) {
+  unsigned long now = millis();
+  unsigned long dt  = (lastEventMs == 0) ? 0 : (now - lastEventMs);
+  lastEventMs = now;
+
+  String line;
+  line.reserve(128);
+  line += "TIM,";
+  line += myId; line += ",";
+  line += role; line += ",";
+  line += event; line += ",";
+  line += String(seq); line += ",";
+  line += String(idx); line += ",";
+  line += String(tot); line += ",";
+  line += String(bytes); line += ",";
+  line += rssiStr; line += ",";
+  line += snrStr; line += ",";
+  line += String((long)round(toa_ms)); line += ",";
+  line += String(now); line += ",";
+  line += String(dt);
+
+  Serial.println(line);
+  writeCsvLine(line);
+}
+
+static void logEvtTx(const char* event, long seq, long idx, long tot, long bytes, size_t payloadLen) {
+  double toa = loraToaMs(payloadLen);
+  logEvt("TX", event, seq, idx, tot, bytes, "-", "-", toa);
+}
+static void logEvtRx(const char* event, long seq, long idx, long tot, long bytes, size_t payloadLen, int rssi, float snr) {
+  double toa = loraToaMs(payloadLen);
+  logEvt("RX", event, seq, idx, tot, bytes, String(rssi), String(snr,1), toa);
+}
 
 // ---------- Parsers ----------
 static bool parseMSG (const String& in, String& src,String& dst,long& seq,String& text){
@@ -99,7 +210,7 @@ static bool parseACK (const String& in, String& src,String& dst,long& seq,uint64
   src=in.substring(4,p1); dst=in.substring(p1+1,p2); String seqStr=in.substring(p2+1,p3); String bStr=in.substring(p3+1,p4); String kStr=in.substring(p4+1);
   seq=toLong(seqStr); rxTotBytes=(uint64_t)bStr.toDouble(); rxTotPkts=(uint64_t)kStr.toDouble(); return true; }
 
-// ---------- RX reassembly (one in-flight per peer) ----------
+// ---------- RX reassembly ----------
 String   reSrc=""; long reSeq=-1; long reTot=0; long reGot=0;
 String*  reChunks=nullptr; bool* reHave=nullptr;
 
@@ -108,35 +219,46 @@ void startReasm(const String& src, long seq, long tot){ resetReasm(); reSrc=src;
 bool addFrag(long idx, const String& chunk){ if(idx<0||idx>=reTot) return false; if(!reHave[idx]){ reHave[idx]=true; reChunks[idx]=chunk; reGot++; return true; } return false; }
 String joinReasm(){ String out; out.reserve(reTot*FRAG_CHUNK); for(long i=0;i<reTot;i++) out += reChunks[i]; return out; }
 
-// ---------- Blocking waits (consume radio while waiting) ----------
+// ---------- Blocking waits ----------
 bool waitForAckF(long expectSeq, long expectIdx, unsigned long timeoutMs){
+  logEvt("TX","WAIT_ACKF_START", expectSeq, expectIdx, -1, 0, "-", "-", 0);
   unsigned long deadline=millis()+timeoutMs;
   while((long)(millis()-deadline)<0){
     int psz=LoRa.parsePacket();
     if(psz){
       String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+      int rssi=LoRa.packetRssi(); float snr=LoRa.packetSnr();
       String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t b=0,k=0;
 
       if(parseACKF(pkt,s,d,seq,idx)){
-        if(d==myId && seq==expectSeq && idx==expectIdx) return true; // got it
+        logEvtRx("ACKF_RX", seq, idx, -1, pkt.length(), pkt.length(), rssi, snr);
+        if(d==myId && seq==expectSeq && idx==expectIdx){
+          logEvt("TX","WAIT_ACKF_OK", seq, idx, -1, 0, "-", "-", 0);
+          return true; // got it
+        }
       }
-      else if(parseACK(pkt,s,d,seq,b,k)){ /* ignore here */ }
+      else if(parseACK(pkt,s,d,seq,b,k)){
+        logEvtRx("ACK_RX", seq, -1, -1, pkt.length(), pkt.length(), rssi, snr);
+      }
       else if(parseMSG(pkt,s,d,seq,t)){
         size_t pktBytes=pkt.length(), textBytes=t.length();
         rxDataPktsTotal++; rxBytesTotal+=textBytes;
-        Serial.printf("[RX] #%ld from %s (single while waiting)\n", seq, s.c_str());
-        Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
-        Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",(unsigned)textBytes, bytesToHuman(textBytes).c_str(), (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+        logEvtRx("MSG_RX", seq, -1, -1, pktBytes, pktBytes, rssi, snr);
         serialPrintLnChunked(t);
         oled3("RX <- ("+String(seq)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
         String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
         sendLoRa(ack);
+        logEvtTx("ACK_TX", seq, -1, -1, ack.length(), ack.length());
       }
       else if(parseMSGF(pkt,s,d,seq,idx,tot,t)){
         if(s!=reSrc||seq!=reSeq) startReasm(s,seq,tot);
         bool fresh=addFrag(idx,t);
-        if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); } // unique only
-        String ackf="ACKF,"+myId+","+s+","+String(seq)+","+String(idx); sendLoRa(ackf);
+        if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); }
+        logEvtRx("MSGF_RX", seq, idx, tot, pkt.length(), pkt.length(), rssi, snr);
+
+        String ackf="ACKF,"+myId+","+s+","+String(seq)+","+String(idx);
+        sendLoRa(ackf);
+        logEvtTx("ACKF_TX", seq, idx, -1, ackf.length(), ackf.length());
 
         bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
         if(all){
@@ -145,53 +267,59 @@ bool waitForAckF(long expectSeq, long expectIdx, unsigned long timeoutMs){
           serialPrintLnChunked(full);
           oled3("RX <- ("+String(seq)+")","full msg", bytesToHuman(full.length()));
           String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
-          sendLoRa(ack); resetReasm();
+          sendLoRa(ack); logEvtTx("ACK_TX", seq, -1, -1, ack.length(), ack.length());
+          resetReasm();
         }
       }
     }
     delay(1);
   }
+  logEvt("TX","WAIT_ACKF_TO", expectSeq, expectIdx, -1, 0, "-", "-", 0);
   return false; // timeout
 }
 
 bool waitForFinalAck(long expectSeq, unsigned long timeoutMs, double &pdrOut, double &bpsOut){
+  logEvt("TX","WAIT_ACK_START", expectSeq, -1, -1, 0, "-", "-", 0);
   unsigned long deadline=millis()+timeoutMs; pdrOut=0; bpsOut=0;
   while((long)(millis()-deadline)<0){
     int psz=LoRa.parsePacket();
     if(psz){
       String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+      int rssi=LoRa.packetRssi(); float snr=LoRa.packetSnr();
       String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t peerBytes=0, peerPkts=0;
 
       if(parseACK(pkt,s,d,seq,peerBytes,peerPkts)){
+        logEvtRx("ACK_RX", seq, -1, -1, pkt.length(), pkt.length(), rssi, snr);
         if(d==myId && seq==expectSeq){
           unsigned long elapsed=millis()-sessionStartMs;
           bpsOut = elapsed? (peerBytes*8.0*1000.0/elapsed) : 0.0;
           pdrOut = (txDataPktsTotal>0)? (100.0*(double)peerPkts/(double)txDataPktsTotal) : 0.0;
-          int rssi=LoRa.packetRssi(); float snr=LoRa.packetSnr();
+          int rssi2=LoRa.packetRssi(); float snr2=LoRa.packetSnr();
           Serial.printf("[ACK OK] #%ld from %s | peerRxBytes=%llu | peerRxPkts=%llu | PDR=%.1f%% | %s | RSSI %d | SNR %.1f\n",
                         seq, s.c_str(), (unsigned long long)peerBytes, (unsigned long long)peerPkts,
-                        pdrOut, speedToHuman(bpsOut).c_str(), rssi, snr);
+                        pdrOut, speedToHuman(bpsOut).c_str(), rssi2, snr2);
           oled3("ACK OK ("+String(seq)+")", "PDR "+String(pdrOut,1)+"%  "+bytesToHuman(peerBytes), speedToHuman(bpsOut));
+          logEvt("TX","WAIT_ACK_OK", seq, -1, -1, 0, "-", "-", 0);
           return true;
         }
       } else {
-        // process other traffic while we wait
         String s2,d2; long seq2=-1,idx2=-1,tot2=-1; uint64_t b2=0,k2=0;
         if(parseMSG(pkt,s2,d2,seq2,t)){
           size_t pktBytes=pkt.length(), textBytes=t.length();
           rxDataPktsTotal++; rxBytesTotal+=textBytes;
-          Serial.printf("[RX] #%ld from %s (single while waiting ACK)\n", seq2, s2.c_str());
-          Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
-          Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",(unsigned)textBytes, bytesToHuman(textBytes).c_str(), (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+          logEvtRx("MSG_RX", seq2, -1, -1, pktBytes, pktBytes, rssi, snr);
           serialPrintLnChunked(t);
           oled3("RX <- ("+String(seq2)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
           String ack="ACK,"+myId+","+s2+","+String(seq2)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
-          sendLoRa(ack);
+          sendLoRa(ack); logEvtTx("ACK_TX", seq2, -1, -1, ack.length(), ack.length());
         } else if(parseMSGF(pkt,s2,d2,seq2,idx2,tot2,t)){
           if(s2!=reSrc||seq2!=reSeq) startReasm(s2,seq2,tot2);
           bool fresh=addFrag(idx2,t);
           if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); }
-          String ackf="ACKF,"+myId+","+s2+","+String(seq2)+","+String(idx2); sendLoRa(ackf);
+          logEvtRx("MSGF_RX", seq2, idx2, tot2, pkt.length(), pkt.length(), rssi, snr);
+
+          String ackf="ACKF,"+myId+","+s2+","+String(seq2)+","+String(idx2);
+          sendLoRa(ackf); logEvtTx("ACKF_TX", seq2, idx2, -1, ackf.length(), ackf.length());
           bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
           if(all){
             String full=joinReasm();
@@ -199,28 +327,28 @@ bool waitForFinalAck(long expectSeq, unsigned long timeoutMs, double &pdrOut, do
             serialPrintLnChunked(full);
             oled3("RX <- ("+String(seq2)+")","full msg", bytesToHuman(full.length()));
             String ack="ACK,"+myId+","+s2+","+String(seq2)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
-            sendLoRa(ack); resetReasm();
+            sendLoRa(ack); logEvtTx("ACK_TX", seq2, -1, -1, ack.length(), ack.length());
+            resetReasm();
           }
         } else if(parseACKF(pkt,s2,d2,seq2,idx2)){
-          // ignore here; fragment sender's loop is waiting for its own ACKF
+          logEvtRx("ACKF_RX", seq2, idx2, -1, pkt.length(), pkt.length(), rssi, snr);
         }
       }
     }
     delay(1);
   }
+  logEvt("TX","WAIT_ACK_TO", expectSeq, -1, -1, 0, "-", "-", 0);
   return false; // timeout
 }
 
-// ---------- Send one message reliably (with EXACT tries) ----------
+// ---------- Send one message reliably ----------
 bool sendMessageReliable(const String& lineIn){
   String line=lineIn; sanitizeText(line);
   const bool single = (line.length() <= FRAG_CHUNK);
   const size_t L=line.length();
   const size_t total = single ? 1 : (L + FRAG_CHUNK - 1)/FRAG_CHUNK;
 
-  // Reserve a seq for this logical message and KEEP IT across attempts
-  uint32_t seq = txSeq;
-  txSeq++;
+  uint32_t seq = txSeq; txSeq++;
 
   for(int attempt=1; attempt<=MSG_MAX_TRIES; ++attempt){
     Serial.printf("[ATTEMPT %d/%d] seq #%lu\n", attempt, MSG_MAX_TRIES, (unsigned long)seq);
@@ -230,16 +358,15 @@ bool sendMessageReliable(const String& lineIn){
       sendLoRa(payload);
       size_t pktBytes=payload.length(), textBytes=line.length();
       txDataPktsTotal++; txBytesTotal+=textBytes;
+      logEvtTx("MSG_TX", seq, -1, -1, pktBytes, pktBytes);
 
-      Serial.printf("  [TX] single %u bytes (%s, %s) | txt %uB\n",
-                    (unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str(),
-                    (unsigned)textBytes);
       oled3("TX -> ("+String(seq)+")", line.substring(0,16), "txt "+String(textBytes)+"B");
 
       double pdr=0,bps=0;
       if(waitForFinalAck(seq, BASE_FINAL_ACK_TIMEOUT_MS, pdr, bps)) return true;
 
       Serial.println("  -> final ACK timeout, will retry whole message");
+      logEvt("TX","RETRY_MSG", seq, -1, -1, 0, "-", "-", 0);
       delay(100);
     } else {
       bool fragFailed=false;
@@ -254,17 +381,13 @@ bool sendMessageReliable(const String& lineIn){
           sendLoRa(payload);
           size_t pktBytes=payload.length();
           txDataPktsTotal++; txBytesTotal+=chunk.length();
-
-          Serial.printf("  [TX FRAG %u/%u try %d] %u bytes (%s, %s) | txt %uB\n",
-                        (unsigned)(i+1), (unsigned)total, ftry, (unsigned)pktBytes,
-                        bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str(),
-                        (unsigned)chunk.length());
+          logEvtTx("MSGF_TX", seq, (long)i, (long)total, pktBytes, pktBytes);
 
           ok = waitForAckF((long)seq, (long)i, FRAG_ACK_TIMEOUT_MS);
           if(ok) break;
 
-          if(ftry < FRAG_MAX_TRIES) Serial.println("   -> no ACKF, retrying...");
-          else                      Serial.println("   -> no ACKF, giving up fragment");
+          if(ftry < FRAG_MAX_TRIES) { Serial.println("   -> no ACKF, retrying..."); logEvt("TX","RETRY_FRAG", seq, (long)i, (long)total, 0, "-", "-", 0); }
+          else                      { Serial.println("   -> no ACKF, giving up fragment"); }
           delay(FRAG_SPACING_MS);
         }
 
@@ -273,6 +396,7 @@ bool sendMessageReliable(const String& lineIn){
 
       if(fragFailed){
         Serial.println("  -> fragment failed after retries, will retry whole message");
+        logEvt("TX","RETRY_MSG", seq, -1, -1, 0, "-", "-", 0);
         delay(150);
       } else {
         double pdr=0,bps=0;
@@ -280,12 +404,14 @@ bool sendMessageReliable(const String& lineIn){
         if(waitForFinalAck(seq, finalWait, pdr, bps)) return true;
 
         Serial.println("  -> final ACK timeout, will retry whole message");
+        logEvt("TX","RETRY_MSG", seq, -1, -1, 0, "-", "-", 0);
         delay(150);
       }
     }
   }
 
   Serial.println("[ABORT] message failed after MSG_MAX_TRIES");
+  logEvt("TX","ABORT", (long)(txSeq-1), -1, -1, 0, "-", "-", 0);
   oled3("SEND FAILED","after retries","");
   return false;
 }
@@ -298,7 +424,7 @@ void setup(){
 #ifdef MY_NODE_ID
   myId = String(MY_NODE_ID);
 #else
-  macTo12Hex(myId);  // full 48-bit MAC -> 12 hex
+  macTo12Hex(myId);
 #endif
 
   SPI.begin(SCK,MISO,MOSI,SS); LoRa.setPins(SS,RST,DIO0);
@@ -307,12 +433,19 @@ void setup(){
   LoRa.setSyncWord(LORA_SYNC);
   LoRa.enableCrc();
   LoRa.setTxPower(17, PA_OUTPUT_PA_BOOST_PIN);
-  // Optional AS923-friendly robustness:
-  // LoRa.setSignalBandwidth(125E3);   // AS923 uses 125 kHz channels
-  // LoRa.setCodingRate4(5);           // 4/5 (default); 4/6..4/8 add redundancy
+  // Optional AS923 channel shaping:
+  // LoRa.setSignalBandwidth(125E3);
+  // LoRa.setCodingRate4(5);
 
   sessionStartMs = millis();
+  lastEventMs    = sessionStartMs;
   resetReasm();
+
+  openCsvLog(); // <-- start LittleFS CSV auto-save
+
+  // CSV header for live serial viewing
+  Serial.println("TIM_HDR,nodeId,role,event,seq,idx,tot,bytes,rssi,snr,toa_ms,t_ms,dt_ms");
+  logEvt("TX","SESSION_START", -1, -1, -1, 0, "-", "-", 0);
 
   oled3("LoRa Chat Ready","ID: "+myId,"923 MHz, SF="+String(LORA_SF));
   Serial.println("=== LoRa Chat (Reliable + Exact Tries) — AS923 (923 MHz) ===");
@@ -321,59 +454,59 @@ void setup(){
 }
 
 void loop(){
-  // 1) Send when user types
+  // 1) Send when user types (plain text lines become a message)
   if(Serial.available()){
     String line=Serial.readStringUntil('\n'); line.trim();
     if(line.length()) sendMessageReliable(line);
   }
 
-  // 2) Otherwise receive and serve peers
+  // 2) Otherwise receive
   int psz=LoRa.parsePacket();
   if(psz){
     String pkt; while(LoRa.available()) pkt+=(char)LoRa.read();
+    int rssi=LoRa.packetRssi(); float snr=LoRa.packetSnr();
     String s,d,t; long seq=-1,idx=-1,tot=-1; uint64_t b=0,k=0;
 
     if(parseACK(pkt,s,d,seq,b,k)){
-      Serial.printf("[ACK stray] #%ld from %s | rxBytes=%llu rxPkts=%llu\n",
-                    seq, s.c_str(), (unsigned long long)b, (unsigned long long)k);
+      logEvtRx("ACK_RX", seq, -1, -1, pkt.length(), pkt.length(), rssi, snr);
       return;
     }
     if(parseACKF(pkt,s,d,seq,idx)){
-      // stray ACKF (we aren't waiting here) → ignore
+      logEvtRx("ACKF_RX", seq, idx, -1, pkt.length(), pkt.length(), rssi, snr);
       return;
     }
     if(parseMSG(pkt,s,d,seq,t)){
       size_t pktBytes=pkt.length(), textBytes=t.length();
       rxDataPktsTotal++; rxBytesTotal+=textBytes;
-      Serial.printf("[RX] #%ld from %s (single)\n", seq, s.c_str());
-      Serial.printf("     Packet: %u bytes (%s, %s)\n",(unsigned)pktBytes, bitsToHuman((uint64_t)pktBytes*8).c_str(), bytesToHuman(pktBytes).c_str());
-      Serial.printf("     Text:   %u bytes (%s) | rxTotal=%llu | rxPkts=%llu\n",
-                    (unsigned)textBytes, bytesToHuman(textBytes).c_str(),
-                    (unsigned long long)rxBytesTotal, (unsigned long long)rxDataPktsTotal);
+      logEvtRx("MSG_RX", seq, -1, -1, pktBytes, pktBytes, rssi, snr);
+
       serialPrintLnChunked(t);
       oled3("RX <- ("+String(seq)+")", t.substring(0,16), "txt "+String(textBytes)+"B");
       String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
-      sendLoRa(ack); return;
+      sendLoRa(ack); logEvtTx("ACK_TX", seq, -1, -1, ack.length(), ack.length());
+      return;
     }
     if(parseMSGF(pkt,s,d,seq,idx,tot,t)){
       if(s!=reSrc||seq!=reSeq) startReasm(s,seq,tot);
       bool fresh=addFrag(idx,t);
       if(fresh){ rxDataPktsTotal++; rxBytesTotal+=t.length(); }
+      logEvtRx("MSGF_RX", seq, idx, tot, pkt.length(), pkt.length(), rssi, snr);
+
       String ackf="ACKF,"+myId+","+s+","+String(seq)+","+String(idx); sendLoRa(ackf);
+      logEvtTx("ACKF_TX", seq, idx, -1, ackf.length(), ackf.length());
 
       bool all=true; for(long i=0;i<reTot;i++) if(!reHave[i]){ all=false; break; }
       if(all){
         String full=joinReasm();
-        Serial.printf("[RX FULL] #%ld from %s | total text %uB\n", seq, s.c_str(), (unsigned)full.length());
         serialPrintLnChunked(full);
         oled3("RX <- ("+String(seq)+")","full msg", bytesToHuman(full.length()));
         String ack="ACK,"+myId+","+s+","+String(seq)+","+String((unsigned long long)rxBytesTotal)+","+String((unsigned long long)rxDataPktsTotal);
-        sendLoRa(ack); resetReasm();
+        sendLoRa(ack); logEvtTx("ACK_TX", seq, -1, -1, ack.length(), ack.length());
+        resetReasm();
       }
       return;
     }
-    // else: unknown payload, ignore
-  }
+  }WAIT_ACKF_START
 
   delay(1);
 }
