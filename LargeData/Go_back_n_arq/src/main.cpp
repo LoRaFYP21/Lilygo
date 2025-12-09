@@ -38,7 +38,7 @@
 
 // ---------- WiFi & NTP config ----------
 #define WIFI_SSID "Thaveesha"
-#define WIFI_PASSWORD "101010101"
+#define WIFI_PASSWORD "10101010"
 #define NTP_SERVER "pool.ntp.org"
 #define GMT_OFFSET_SEC 0           // UTC timezone (adjust as needed)
 #define DAYLIGHT_OFFSET_SEC 0      // Daylight saving (0 if not applicable)
