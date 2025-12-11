@@ -23,6 +23,8 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 pip install -r requirements.txt
 # or, if no requirements file:
 pip install pillow pydub
+# For GUI capture/record features:
+pip install sounddevice scipy opencv-python
 ```
 
 ## 3) Receive files
@@ -83,3 +85,30 @@ deactivate
 - Permission error on activation: Use the execution policy bypass snippet above.
 - Wrong COM port: The script will fail to open the serial port. Verify in Device Manager and update the command.
 - Image/audio conversion recursion error: Update to latest `tx_send_file.py` (we pass `--jpeg-quality` and `--mp3-bitrate` directly now; no monkeypatching). If you see `RecursionError`, pull latest changes and retry.
+
+## GUI Usage (TX + RX in one app)
+
+Run the GUI to send files/text and to listen/receive without CLI commands.
+
+```powershell
+Set-Location "C:\Users\HP\Desktop\Sem 7\Project\Lilygo\LargeData\LoRa_RealTime_MultiM"
+.\.venv\Scripts\Activate.ps1
+python gui_app.py
+```
+
+- Transmit tab:
+  - Choose a file and click "Send File".
+  - Type text and click "Send Text" (text is sent as a file).
+  - Click "Record Voice" to capture mic audio (WAV) and send; MP3 conversion occurs on TX.
+  - Click "Capture Photo" to take a camera snapshot and send.
+  - Set `TX Serial Port`, `JPEG Quality`, `MP3 Bitrate` as needed.
+- Receive tab:
+  - Set `RX Serial Port` and `Out Dir`, click "Start Listening".
+  - Saved files include `_rx` suffix (e.g., `my_notes_rx.txt`).
+  - Logs show MCU messages and assembled payloads.
+
+### GUI prerequisites
+
+- Install optional packages in venv: `pip install sounddevice scipy opencv-python`.
+- Camera uses device index 0; if multiple cameras exist, we can add selection.
+- COM ports must be distinct for TX and RX (e.g., `COM9` vs `COM12`).

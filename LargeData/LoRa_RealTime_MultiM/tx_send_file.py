@@ -171,6 +171,50 @@ def wait_for_chunk_done(ser: serial.Serial, chunk_idx: int, chunk_tot: int) -> b
     return ok
 
 
+def send_file(serial_port: str, file_path: str, baud: int = BAUD_RATE, chunk_size: int = CHUNK_SIZE, jpeg_quality: int = 85, mp3_bitrate: str = "64k") -> None:
+    """
+    Programmatic API to send a file over LoRa via the TX MCU.
+    """
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"file '{path}' not found")
+
+    raw, tx_name, desc = prepare_file_for_lora(path, jpeg_quality=jpeg_quality, mp3_bitrate=mp3_bitrate)
+    print(f"[INFO] Final transmit name: {tx_name}")
+    print(f"[INFO] Mode: {desc}")
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    print(f"[INFO] Base64 length: {len(b64)} characters")
+
+    chunks = [b64[i : i + chunk_size] for i in range(0, len(b64), chunk_size)]
+    tot = len(chunks)
+    print(f"[INFO] Will send {tot} FILECHUNK lines to MCU")
+
+    print(f"[INFO] Opening serial port {serial_port} @ {baud}...")
+    with serial.Serial(serial_port, baud, timeout=1) as ser:
+        time.sleep(3.0)
+
+        boot_deadline = time.time() + 3.0
+        while time.time() < boot_deadline:
+            line = ser.readline().decode(errors="ignore").strip()
+            if line:
+                print(f"[MCU-BOOT] {line}")
+
+        for idx, chunk in enumerate(chunks):
+            print(f"\n=== Sending FILECHUNK {idx+1}/{tot} (len={len(chunk)}) ===")
+            payload = f"FILECHUNK:{tx_name}:{idx}:{tot}:{chunk}\n"
+            ser.write(payload.encode("utf-8"))
+            ser.flush()
+
+            print(f"[INFO] Waiting for MCU to finish chunk {idx+1}/{tot}...")
+            ok = wait_for_chunk_done(ser, idx, tot)
+            if not ok:
+                print("[ERROR] Stopping due to TX failure.")
+                break
+
+        print("\n[INFO] All FILECHUNK lines sent (TX side finished).")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generic LoRa file sender (text, image->JPEG, audio->MP3)."
@@ -194,50 +238,17 @@ def main():
     )
     args = parser.parse_args()
 
-    path = Path(args.file)
-    if not path.is_file():
-        print(f"Error: file '{path}' not found.")
-        return
-
-    # Prepare file bytes (with conversions if needed)
-    raw, tx_name, desc = prepare_file_for_lora(path, jpeg_quality=args.jpeg_quality, mp3_bitrate=args.mp3_bitrate)
-    print(f"[INFO] Final transmit name: {tx_name}")
-    print(f"[INFO] Mode: {desc}")
-
-    b64 = base64.b64encode(raw).decode("ascii")
-    print(f"[INFO] Base64 length: {len(b64)} characters")
-
-    # Split into big base64 chunks
-    chunks = [b64[i : i + args.chunk_size] for i in range(0, len(b64), args.chunk_size)]
-    tot = len(chunks)
-    print(f"[INFO] Will send {tot} FILECHUNK lines to MCU")
-
-    # Open serial
-    print(f"[INFO] Opening serial port {args.serial_port} @ {args.baud}...")
-    with serial.Serial(args.serial_port, args.baud, timeout=1) as ser:
-        time.sleep(3.0)  # give ESP32 time to boot/reset
-
-        # Dump initial boot messages
-        boot_deadline = time.time() + 3.0
-        while time.time() < boot_deadline:
-            line = ser.readline().decode(errors="ignore").strip()
-            if line:
-                print(f"[MCU-BOOT] {line}")
-
-        # Send chunks one by one
-        for idx, chunk in enumerate(chunks):
-            print(f"\n=== Sending FILECHUNK {idx+1}/{tot} (len={len(chunk)}) ===")
-            payload = f"FILECHUNK:{tx_name}:{idx}:{tot}:{chunk}\n"
-            ser.write(payload.encode("utf-8"))
-            ser.flush()
-
-            print(f"[INFO] Waiting for MCU to finish chunk {idx+1}/{tot}...")
-            ok = wait_for_chunk_done(ser, idx, tot)
-            if not ok:
-                print("[ERROR] Stopping due to TX failure.")
-                break
-
-        print("\n[INFO] All FILECHUNK lines sent (TX side finished).")
+    try:
+        send_file(
+            serial_port=args.serial_port,
+            file_path=args.file,
+            baud=args.baud,
+            chunk_size=args.chunk_size,
+            jpeg_quality=args.jpeg_quality,
+            mp3_bitrate=args.mp3_bitrate,
+        )
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
 
 
 if __name__ == "__main__":
