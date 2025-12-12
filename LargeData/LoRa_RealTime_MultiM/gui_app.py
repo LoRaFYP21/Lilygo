@@ -116,7 +116,11 @@ class TxFrame(ttk.Frame):
             tmp_wav = Path("_tmp_record.wav")
             wav_write(tmp_wav, sr, audio)
             # Send; MP3 conversion handled by tx_send_file
-            send_file(serial_port=port, file_path=str(tmp_wav))
+            send_file(
+                serial_port=port,
+                file_path=str(tmp_wav),
+                mp3_bitrate=self.mp3_bitrate_var.get(),
+            )
             messagebox.showinfo("Sent", "Recorded voice sent")
         except Exception as e:
             messagebox.showerror("Record failed", str(e))
@@ -140,16 +144,21 @@ class TxFrame(ttk.Frame):
             if not ret:
                 messagebox.showerror("Capture failed", "Could not read frame from camera")
                 return
-            tmp_jpg = Path("_tmp_capture.jpg")
-            cv2.imwrite(str(tmp_jpg), frame)
-            send_file(serial_port=port, file_path=str(tmp_jpg))
+            # Save as PNG so TX path will convert to JPEG with the selected quality
+            tmp_png = Path("_tmp_capture.png")
+            cv2.imwrite(str(tmp_png), frame)
+            send_file(
+                serial_port=port,
+                file_path=str(tmp_png),
+                jpeg_quality=self.jpeg_quality_var.get(),
+            )
             messagebox.showinfo("Sent", "Captured photo sent")
         except Exception as e:
             messagebox.showerror("Capture failed", str(e))
         finally:
             cap.release()
             try:
-                tmp_jpg.unlink()
+                tmp_png.unlink()
             except Exception:
                 pass
 
