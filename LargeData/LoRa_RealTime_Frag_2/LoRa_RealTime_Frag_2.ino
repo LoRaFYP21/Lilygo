@@ -832,7 +832,7 @@ void setup()
     LoRa.setSyncWord(LORA_SYNC);
     LoRa.enableCrc();
     LoRa.setTxPower(17, PA_OUTPUT_PA_BOOST_PIN);
-    LoRa.setSignalBandwidth(5000E3);
+    LoRa.setSignalBandwidth(500E3);
 
     sessionStartMs = millis();
     resetReasm();
