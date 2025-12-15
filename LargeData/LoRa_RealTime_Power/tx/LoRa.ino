@@ -1,18 +1,20 @@
 /*
-  LoRa SF/BW Sweep + RF Power Logging (TX cfg dBm, RSSI dBm, SNR dB, Path loss dB)
+  LoRa SF/BW Sweep + TX/RX Power (electrical) logging to Serial for PC CSV capture
   - SAME sketch for TX and RX devices (role set via Serial, saved in NVS)
-  - TX trigger from PC: sends TRIG over LoRa (robust: SF12/BW125k, repeated)
+  - TX trigger from PC: sends TRIG over LoRa
   - RX waits for TRIG, then both follow same SF/BW schedule
   - Every 10 seconds: change config to next (SF,BW) combo
   - TX sends: "HELLO,sf,bw,seq,Hello SF=.. and BW=.."
   - RX replies ACK: "ACK,seq"
   - Serial outputs lines starting with: LOG,...
 
-  RF logging:
-    - txp_dbm: configured TX output power (dBm) (not measured)
-    - rssi_dbm: received signal strength indicator (dBm)
-    - snr_db: packet SNR estimate (dB)
-    - pathloss_db: estimated path loss = txp_dbm - rssi_dbm (forward link)
+  Power logging:
+    - txp_dbm: configured TX output power setting (e.g., 17 dBm)
+    - ptx_mw / prx_mw: estimated electrical power consumption (mW)
+    - ptx_dbm_eq / prx_dbm_eq: 10*log10(mW) (math conversion, not RF)
+    - RSSI / ACK_RSSI: RF received signal strength in dBm
+
+  Region: AS923 @ 923 MHz
 */
 
 #include <SPI.h>
@@ -50,15 +52,9 @@ static const uint16_t PREAMBLE_SYMS = 8;
 static const int TX_POWER_DBM = 17;
 static const uint8_t PA_PIN = PA_OUTPUT_PA_BOOST_PIN;
 
-// retry behavior inside slot
+// retry behavior inside slot (prevents “RX missed the packet”)
 static const uint32_t ACK_TIMEOUT_MS = 1200;     // wait ACK
 static const uint32_t RETRY_GAP_MS = 1000;       // resend within slot if no ACK
-
-// Robust trigger mode (for TRIG)
-static const uint8_t TRIG_SF = 12;
-static const long    TRIG_BW = 125000;
-static const uint8_t TRIG_REPEATS = 3;
-static const uint32_t TRIG_GAP_MS = 300;
 
 // ===================== ROLE / STATE =====================
 enum Role : uint8_t { ROLE_RX = 0, ROLE_TX = 1 };
@@ -119,9 +115,26 @@ static double loraToA_ms(uint8_t sf, long bw_hz, int payload_len) {
   return Tpacket * 1000.0;
 }
 
-// Estimated path loss (forward link) from configured TX power and RX RSSI
-static double pathloss_db(int tx_dbm, int rssi_dbm) {
-  return (double)tx_dbm - (double)rssi_dbm;
+// ===== Electrical power estimate (mW) =====
+// These are “board-level rough typicals” (good for comparisons across SF/BW)
+static double txCurrent_mA(int dbm) {
+  if (dbm >= 17) return 120.0;
+  if (dbm >= 14) return 80.0;
+  if (dbm >= 10) return 45.0;
+  return 35.0;
+}
+static double rxCurrent_mA() {
+  return 12.0;
+}
+static double power_mW(double current_mA, double v = 3.3) {
+  return v * (current_mA / 1000.0) * 1000.0; // V*A => W ; *1000 => mW
+}
+static double dbm_equiv_from_mW(double mw) {
+  if (mw <= 0.000001) return -120.0;
+  return 10.0 * log10(mw);
+}
+static double energy_mJ(double current_mA, double toa_ms, double v = 3.3) {
+  return v * (current_mA / 1000.0) * (toa_ms / 1000.0) * 1000.0;
 }
 
 static void logLine(const String &line) {
@@ -172,7 +185,7 @@ static bool parseAck(const String &pkt, uint32_t &seq) {
 }
 
 // ===================== ACK WAIT (TX) =====================
-static bool waitAck(uint32_t expectSeq, uint32_t timeoutMs, int &outRssi, float &outSnr) {
+static bool waitAck(uint32_t expectSeq, uint32_t timeoutMs, int &outRssi) {
   uint32_t deadline = millis() + timeoutMs;
   while ((int32_t)(millis() - deadline) < 0) {
     int psz = LoRa.parsePacket();
@@ -182,7 +195,6 @@ static bool waitAck(uint32_t expectSeq, uint32_t timeoutMs, int &outRssi, float 
       uint32_t s = 0;
       if (parseAck(pkt, s) && s == expectSeq) {
         outRssi = LoRa.packetRssi();
-        outSnr  = LoRa.packetSnr();
         return true;
       }
     }
@@ -199,15 +211,6 @@ static void comboFromIdx(int idx, uint8_t &sf, long &bw) {
   int bw_i = idx % NUM_BW;
   sf = SF_VALUES[sf_i];
   bw = BW_VALUES_HZ[bw_i];
-}
-
-static int currentSlotIdx() {
-  if (st != ST_RUNNING) return -1;
-  if ((int32_t)(millis() - t0_ms) < 0) return -1;
-  uint32_t elapsed = millis() - t0_ms;
-  int idx = (int)(elapsed / SLOT_MS);
-  if (idx < 0 || idx >= totalCombos()) return -1;
-  return idx;
 }
 
 static void startRunning(uint32_t newTestId) {
@@ -248,8 +251,7 @@ static void handleRunning() {
     logLine("LOG,CFG,testId," + String(testId) +
             ",slot," + String(idx) +
             ",sf," + String(sf) +
-            ",bw," + String(bw) +
-            ",txp_dbm," + String(TX_POWER_DBM));
+            ",bw," + String(bw));
   }
 
   // TX: retry within slot until ACK or slot ends
@@ -267,15 +269,18 @@ static void handleRunning() {
       int payloadLen = pkt.length();
       double toa = loraToA_ms(sf, bw, payloadLen);
 
+      double itx = txCurrent_mA(TX_POWER_DBM);
+      double ptx_mw = power_mW(itx);
+      double ptx_dbm_eq = dbm_equiv_from_mW(ptx_mw);
+      double etx = energy_mJ(itx, toa);
+
       sendPkt(pkt);
 
       int ackRssi = -200;
-      float ackSnr = NAN;
-      bool got = waitAck(txSeq, ACK_TIMEOUT_MS, ackRssi, ackSnr);
+      bool got = waitAck(txSeq, ACK_TIMEOUT_MS, ackRssi);
       if (got) slotAcked = true;
 
-      double ackPathLoss = got ? pathloss_db(TX_POWER_DBM, ackRssi) : NAN;
-
+      // LOG,TX,... + power fields
       logLine("LOG,TX,testId," + String(testId) +
               ",slot," + String(lastComboIdx) +
               ",sf," + String(sf) +
@@ -284,11 +289,12 @@ static void handleRunning() {
               ",len," + String(payloadLen) +
               ",toa_ms," + String(toa, 2) +
               ",txp_dbm," + String(TX_POWER_DBM) +
+              ",ptx_mw," + String(ptx_mw, 3) +
+              ",ptx_dbm_eq," + String(ptx_dbm_eq, 2) +
+              ",etx_mJ," + String(etx, 4) +
               ",ack," + String(got ? 1 : 0) +
-              ",ack_rssi_dbm," + String(ackRssi) +
-              ",ack_snr_db," + (isnan(ackSnr) ? String("") : String(ackSnr, 2)) +
-              ",ack_pathloss_db," + (isnan(ackPathLoss) ? String("") : String(ackPathLoss, 2)));
-
+              ",ack_rssi," + String(ackRssi));
+      // only increment seq when ACKed (so RX sees same seq for retries)
       if (got) txSeq++;
     }
   }
@@ -318,15 +324,8 @@ static void handleSerialLine(String line) {
       return;
     }
     uint32_t newTest = (uint32_t)millis();
-
-    // ---- Robust TRIG: force strong mode + repeat ----
-    setRadio(TRIG_SF, TRIG_BW);
-    for (uint8_t i = 0; i < TRIG_REPEATS; i++) {
-      sendPkt("TRIG," + String(newTest));
-      delay(TRIG_GAP_MS);
-    }
-    logLine("LOG,EVENT,TRIG_SENT,testId," + String(newTest) + ",sf," + String(TRIG_SF) + ",bw," + String(TRIG_BW));
-
+    sendPkt("TRIG," + String(newTest));
+    logLine("LOG,EVENT,TRIG_SENT,testId," + String(newTest));
     startRunning(newTest);
     return;
   }
@@ -354,8 +353,8 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // Default: robust listening so RX can catch TRIG even at distance
-  setRadio(TRIG_SF, TRIG_BW);
+  // default listen config (RX must start somewhere)
+  setRadio(8, 125000);
 
   logLine("LOG,EVENT,BOOT,id," + myId + ",role," + String((myRole == ROLE_TX) ? "TX" : "RX"));
   logLine("LOG,EVENT,HELP,cmds,ROLE TX|ROLE RX|ARM|GO|STATUS");
@@ -373,43 +372,40 @@ void loop() {
     String pkt;
     while (LoRa.available()) pkt += (char)LoRa.read();
     int rssi = LoRa.packetRssi();
-    float snr = LoRa.packetSnr();
 
     // TRIG handling
     uint32_t trigId = 0;
     if (parseTrig(pkt, trigId)) {
       if (myRole == ROLE_RX && (st == ST_ARMED || st == ST_IDLE)) {
-        logLine("LOG,EVENT,TRIG_RX,testId," + String(trigId) +
-                ",rssi_dbm," + String(rssi) +
-                ",snr_db," + String(snr, 2));
+        logLine("LOG,EVENT,TRIG_RX,testId," + String(trigId) + ",rssi," + String(rssi));
         startRunning(trigId);
       }
       return;
     }
 
-    // HELLO handling => ACK + RX RF fields
+    // HELLO handling => ACK + RX power fields
     uint8_t sf; long bw; uint32_t seq;
     if (parseHello(pkt, sf, bw, seq)) {
       int payloadLen = pkt.length();
       double toa = loraToA_ms(sf, bw, payloadLen);
 
-      // Send ACK
+      double irx = rxCurrent_mA();
+      double prx_mw = power_mW(irx);
+      double prx_dbm_eq = dbm_equiv_from_mW(prx_mw);
+      double erx = energy_mJ(irx, toa);
+
       sendPkt("ACK," + String(seq));
 
-      double pl = pathloss_db(TX_POWER_DBM, rssi);
-      int slot = currentSlotIdx();
-
       logLine("LOG,RX,testId," + String(testId) +
-              ",slot," + String(slot) +
               ",sf," + String(sf) +
               ",bw," + String(bw) +
               ",seq," + String(seq) +
               ",len," + String(payloadLen) +
+              ",rssi," + String(rssi) +
               ",toa_ms," + String(toa, 2) +
-              ",txp_dbm," + String(TX_POWER_DBM) +
-              ",rssi_dbm," + String(rssi) +
-              ",snr_db," + String(snr, 2) +
-              ",pathloss_db," + String(pl, 2));
+              ",prx_mw," + String(prx_mw, 3) +
+              ",prx_dbm_eq," + String(prx_dbm_eq, 2) +
+              ",erx_mJ," + String(erx, 4));
       return;
     }
   }
