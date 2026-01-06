@@ -2,12 +2,12 @@
 
 This repository contains example sketches, tools, and experiments for building a full-stack LoRa messaging and large-data pipeline on LilyGo (TTGO) boards, used in the FYP (final year project) LoRa experiments.
 
-All folders now carry numeric prefixes for consistent navigation. For per-file descriptions, see `PROJECT_FILE_MAP.md`.
+All folders carry numeric prefixes for consistent navigation. For per-file descriptions, see `PROJECT_FILE_MAP.md`.
 
 Contents
-- `02-Bidirectional/` – Ping-pong initiator and responder sketches.
-- `01-Unidirectional/` – Simple TX/RX examples with OLED displays.
-- `03-LargeData/` – Real-time fragmentation, relay/end-node experiments, timing analysis, multi-media file transfer, and power tests.
+- `01-Node_Basics/` - Simple TX/RX examples with OLED displays.
+- `02-Link_PingPong/` - Ping-pong initiator and responder sketches.
+- `03-FullStack_Experiments/` - Fragmentation iterations, seismic/MiniSEED streaming, relay experiments, multi-media tunnel, power/pathloss tests, and timing analysis.
 
 Prerequisites
 - Arduino IDE or PlatformIO (VS Code) for compiling and uploading the `.ino` sketches.
@@ -17,21 +17,21 @@ Prerequisites
 Building and uploading
 
 Arduino IDE
-- Open the `.ino` file for the example you want (for example `02-Bidirectional/01-LoRa_PingPong_Initiator/01-LoRa_PingPong_Initiator.ino`).
+- Open the `.ino` file for the example you want (for example `02-Link_PingPong/01-PingPong_Initiator/01-PingPong_Initiator.ino`).
 - Select the correct board and COM port, then click Upload.
 
 PlatformIO (recommended for the `Timing_Analysis` module)
-- Open `03-LargeData/13-Timing_Analysis` as a PlatformIO project or run from the workspace root with PlatformIO CLI.
+- Open `03-FullStack_Experiments/13-Timing_Analysis` as a PlatformIO project or run from the workspace root with PlatformIO CLI.
 - Example (PowerShell):
 
 ```powershell
-cd "d:\\FYP_Simulations\\LoRa-FullStack\\03-LargeData\\13-Timing_Analysis"
+cd "d:\\FYP_Simulations\\LoRa-FullStack\\03-FullStack_Experiments\\13-Timing_Analysis"
 platformio run --target upload
 ```
 
 Python utilities
-- `03-LargeData/13-Timing_Analysis/csv_capture.py` – captures serial timing logs and writes CSV files.
-- `03-LargeData/13-Timing_Analysis/src/serial_to_udp.py` – forwards serial data over UDP.
+- `03-LargeData/13-Timing_Analysis/csv_capture.py` - captures serial timing logs and writes CSV files.
+- `03-LargeData/13-Timing_Analysis/src/serial_to_udp.py` - forwards serial data over UDP.
 
 Usage notes
 - Most examples are self-contained Arduino sketches. Inspect the top of each `.ino` for hardware-specific configuration (pins, SPI, LoRa frequency, spreading factor, etc.).
@@ -41,21 +41,27 @@ Usage notes
 Repository layout (high-level)
 
 ```
-00-README.md
-01-Unidirectional/
-  01-LoRa_TX_OLED/01-LoRa_TX_OLED.ino
-  02-LoRa_RX_OLED/02-LoRa_RX_OLED.ino
-02-Bidirectional/
-  01-LoRa_PingPong_Initiator/01-LoRa_PingPong_Initiator.ino
-  02-LoRa_PingPong_Responder/02-LoRa_PingPong_Responder.ino
-03-LargeData/
-  01-05 LoRa_RealTime_Frag iterations (*.ino)
-  06-08 LoRa_RealTime_Frag_* with MiniSEED TX/RX sketches
-  09-LoRa_RealTime_SerialMonitor/09-LoRa_RealTime_SerialMonitor.ino
-  10-End_Node_With_Relay/(end + relay sketches)
-  11-LoRa_RealTime_MultiM/ (multi-media tunnel + helpers)
-  12-LoRa_RealTime_Power/ (RX/TX power logging + plots)
-  13-Timing_Analysis/ (PlatformIO timing experiments)
+README.md
+01-Node_Basics/
+  01-TX_OLED/01-TX_OLED.ino
+  02-RX_OLED/02-RX_OLED.ino
+02-Link_PingPong/
+  01-PingPong_Initiator/01-PingPong_Initiator.ino
+  02-PingPong_Responder/02-PingPong_Responder.ino
+03-FullStack_Experiments/
+  01-Fragmentation_v1/01-Fragmentation_v1.ino
+  02-Fragmentation_v2/02-Fragmentation_v2.ino
+  03-Fragmentation_v3/03-Fragmentation_v3.ino
+  04-Fragmentation_v4/04-Fragmentation_v4.ino
+  05-Fragmentation_v5/05-Fragmentation_v5.ino
+  06-Seismic_Stream_v6/ (MiniSEED RX/TX + Python helpers)
+  07-Seismic_Stream_v7/ (MiniSEED RX/TX + Python helpers)
+  08-Seismic_Stream_v8/ (MiniSEED RX/TX + Python helpers)
+  09-Serial_Monitor/09-Serial_Monitor.ino
+  10-Relay_Experiment/(end-node + relay sketches)
+  11-Multimedia_Tunnel/(ARQ multi-media tunnel + helpers)
+  12-Power_Pathloss_Tests/(RX/TX metrics + plots)
+  13-Timing_Analysis/(PlatformIO timing experiments)
   14-Resources/ (papers and reference plots)
   15-Improvements.txt
 ```
@@ -72,4 +78,4 @@ Contact
 - If this is part of your project, update this README with author/contact info and any experiment-specific notes.
 
 ---
-Updated: 2025-12-21
+Updated: 2026-01-06

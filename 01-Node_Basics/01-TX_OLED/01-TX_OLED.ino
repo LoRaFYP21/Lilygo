@@ -11,7 +11,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 
-#define FREQ_HZ      433E6
+#define FREQ_HZ      923E6
 #define LORA_SYNC    0xA5   // keep same on RX
 #define LORA_SF      8
 

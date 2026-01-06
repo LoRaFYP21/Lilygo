@@ -29,7 +29,7 @@
 #include <LoRa.h>
 
 // ---------- Radio config ----------
-#define FREQ_HZ   433E6
+#define FREQ_HZ   923E6
 #define LORA_SYNC 0xA5
 #define LORA_SF   8
 // You can try SF9..12 to improve reliability on weak links.
