@@ -123,7 +123,7 @@ const unsigned long FRAG_ACK_TIMEOUT_MS = 5000; // 5 s (enough for LoRa hop)
 const unsigned long FRAG_SPACING_MS = 150;      // FIX: Spacing to avoid packet collisions (was 80ms)
 const unsigned long LISTEN_AFTER_TX_MS = 500;   // FIX B: Increased from 40ms to 500ms
 
-const int RX_ACK_DELAY_MS = 50; // FIX B: Increased from 20ms to 50ms
+const int RX_ACK_DELAY_MS = 250; // CRITICAL: Ensure TX fully entered RX mode before BACK transmission (was 50ms)
 
 // FIX C: Dedicated ACK slot for GBN/SR after sending window
 const unsigned long ACK_SLOT_MS = 1000; // Listen slot after burst in GBN/SR
@@ -968,8 +968,8 @@ bool sendFragmentsTDDBlockAck(const String &line, size_t L, size_t total, uint32
         LoRa.idle();
         delay(20); // Minimal radio settle (SX127x needs 5-20ms)
         LoRa.receive();
-        Serial.printf("  [TX NOW LISTENING] LoRa RX mode active, waiting for BACK from burst %u-%u\n",
-                      (unsigned)base, (unsigned)(burstEnd - 1));
+        Serial.printf("  [TX NOW LISTENING] T=%lu, LoRa RX mode active, waiting for BACK from burst %u-%u\n",
+                      millis(), (unsigned)base, (unsigned)(burstEnd - 1));
 
         // CRITICAL: Poll during guard period instead of blind delay
         unsigned long guardEnd = millis() + TDD_UPLINK_GUARD_MS;
@@ -1333,7 +1333,10 @@ void loop()
                               timeSinceLastFrag, (unsigned)currentBurstStart, (unsigned)(currentBurstEnd - 1),
                               (unsigned)receivedInBurst, (unsigned)(currentBurstEnd - currentBurstStart));
 
+                Serial.printf("  [TIMING] lastUpdate=%lu now=%lu delay=%dms\n",
+                              rxBlockBuffer.lastUpdate, millis(), RX_ACK_DELAY_MS);
                 delay(RX_ACK_DELAY_MS);
+                Serial.printf("  [SENDING BACK] Now transmitting at T=%lu\n", millis());
                 sendBlockAck(rxBlockBuffer.srcId, rxBlockBuffer.seq, currentBurstStart, currentBurstEnd - currentBurstStart);
                 rxBlockBuffer.lastBurstSent = currentBurstStart;
                 rxBlockBuffer.backDirty = false;         // NEW: Clear dirty flag
